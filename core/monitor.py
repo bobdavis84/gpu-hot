@@ -17,6 +17,7 @@ class GPUMonitor:
 
     def __init__(self):
         self.running = False
+        self.loop_task = None  # Background monitor_loop task, if any
         self.gpu_data = {}
         self.collector = MetricsCollector()
         self.use_smi = {}  # Track which GPUs use nvidia-smi (decided at boot)
