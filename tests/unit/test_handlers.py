@@ -200,3 +200,123 @@ class TestMonitorLoop:
         assert system['load_avg_1'] == 1.5
         assert system['net_bytes_sent'] == 5000
         assert system['disk_read_bytes'] == 50000
+
+
+class FakeWebSocket:
+    """WebSocket stand-in whose connection stays open until disconnect()."""
+
+    def __init__(self):
+        self.sent = []
+        self._closed = asyncio.Event()
+
+    async def accept(self):
+        pass
+
+    async def receive_text(self):
+        await self._closed.wait()
+        raise Exception("client disconnected")
+
+    async def send_text(self, text):
+        self.sent.append(text)
+
+    def disconnect(self):
+        self._closed.set()
+
+
+class TestWebSocketEndpoint:
+    @pytest.mark.asyncio
+    async def test_rapid_reconnect_keeps_single_loop(self):
+        """Reconnecting while collection is suspended does not start a second loop."""
+        from core import handlers
+
+        routes = {}
+
+        class FakeApp:
+            def websocket(self, path):
+                def decorator(func):
+                    routes[path] = func
+                    return func
+                return decorator
+
+        monitor = MagicMock()
+        monitor.running = False
+        monitor.loop_task = None
+        monitor.use_smi = {}
+
+        collect_started = asyncio.Event()
+        resume_collection = asyncio.Event()
+        collect_calls = [0]
+
+        async def get_gpu_data():
+            collect_calls[0] += 1
+            collect_started.set()
+            await resume_collection.wait()
+            return {}
+
+        monitor.get_gpu_data = get_gpu_data
+        monitor.get_processes = AsyncMock(return_value=[])
+
+        handlers.register_handlers(FakeApp(), monitor)
+        endpoint = routes["/socket.io/"]
+        handlers.websocket_connections.clear()
+
+        real_monitor_loop = handlers.monitor_loop
+        loops_started = [0]
+
+        async def counting_monitor_loop(*args):
+            loops_started[0] += 1
+            await real_monitor_loop(*args)
+
+        real_sleep = asyncio.sleep
+        loop_iterations = [0]
+
+        async def fake_sleep(interval):
+            loop_iterations[0] += 1
+            if loop_iterations[0] >= 2:
+                monitor.running = False
+            await real_sleep(0)
+
+        with patch('core.handlers.monitor_loop', counting_monitor_loop), \
+             patch('core.handlers.asyncio.sleep', side_effect=fake_sleep), \
+             patch('psutil.virtual_memory') as mock_vmem, \
+             patch('psutil.cpu_percent', return_value=10.0), \
+             patch('psutil.cpu_count', return_value=4), \
+             patch('psutil.swap_memory', side_effect=Exception), \
+             patch('psutil.cpu_freq', return_value=None), \
+             patch('psutil.getloadavg', side_effect=AttributeError), \
+             patch('psutil.net_io_counters', side_effect=Exception), \
+             patch('psutil.disk_io_counters', return_value=None):
+
+            mock_vmem.return_value = MagicMock(
+                percent=50.0, total=32*1024**3, used=16*1024**3, available=16*1024**3
+            )
+
+            first = FakeWebSocket()
+            first_conn = asyncio.create_task(endpoint(first))
+            await asyncio.wait_for(collect_started.wait(), 1)
+
+            # Disconnect and reconnect while the loop is suspended in collection
+            first.disconnect()
+            await first_conn
+            assert monitor.running is False
+
+            second = FakeWebSocket()
+            second_conn = asyncio.create_task(endpoint(second))
+            for _ in range(5):
+                await real_sleep(0)
+            assert monitor.running is True
+
+            resume_collection.set()
+            for _ in range(50):
+                await real_sleep(0)
+
+            second.disconnect()
+            await second_conn
+
+        handlers.websocket_connections.clear()
+
+        # One loop: started once, two collections, two emits to the new client
+        assert loops_started[0] == 1
+        assert collect_calls[0] == 2
+        assert len(second.sent) == 2
+        assert first.sent == []

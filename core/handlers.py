@@ -24,7 +24,11 @@ def register_handlers(app, monitor):
         
         if not monitor.running:
             monitor.running = True
-            asyncio.create_task(monitor_loop(monitor, websocket_connections))
+            # A quick reconnect can flip the flag back before the previous
+            # loop notices it was paused; that loop resumes instead.
+            task = getattr(monitor, 'loop_task', None)
+            if task is None or task.done():
+                monitor.loop_task = asyncio.create_task(monitor_loop(monitor, websocket_connections))
         
         try:
             # Keep connection alive
